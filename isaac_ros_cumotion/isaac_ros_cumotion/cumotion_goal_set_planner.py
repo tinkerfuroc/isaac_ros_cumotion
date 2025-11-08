@@ -300,6 +300,14 @@ class CumotionGoalSetPlannerServer(CumotionActionServer):
                 )
                 if motion_gen_result.status == MotionGenStatus.IK_FAIL:
                     result.error_code.val = MoveItErrorCodes.NO_IK_SOLUTION
+                    # Output additional IK failure diagnostics
+                    self.get_logger().warn(f'IK Solution failed after {motion_gen_result.attempts} attempts')
+                    if hasattr(motion_gen_result, 'ik_error'):
+                        self.get_logger().warn(f'IK Error: {motion_gen_result.ik_error}')
+                    if hasattr(motion_gen_result, 'position_error'):
+                        self.get_logger().warn(f'Position Error: {motion_gen_result.position_error}')
+                    if hasattr(motion_gen_result, 'rotation_error'):
+                        self.get_logger().warn(f'Rotation Error: {motion_gen_result.rotation_error}')
 
             self.get_logger().info(
                 'returned planning result (query, success, failure_status): '

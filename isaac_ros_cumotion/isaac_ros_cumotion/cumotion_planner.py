@@ -710,16 +710,38 @@ class CumotionActionServer(Node):
             else:
                 start_state = current_joint_state
 
+        plan_mode = "pose"
+        goal_state = None
+        goal_pose = None
+
         if len(plan_req.goal_constraints[0].joint_constraints) > 0:
             self.get_logger().info('Calculating goal pose from Joint target')
-            goal_config = [
+            
+            # Get all joint constraints from the request
+            all_goal_config = [
                 plan_req.goal_constraints[0].joint_constraints[x].position
                 for x in range(len(plan_req.goal_constraints[0].joint_constraints))
             ]
-            goal_jnames = [
+            all_goal_jnames = [
                 plan_req.goal_constraints[0].joint_constraints[x].joint_name
                 for x in range(len(plan_req.goal_constraints[0].joint_constraints))
             ]
+            
+            # Filter to only include active joints known to cumotion
+            active_joint_names = self.motion_gen.kinematics.joint_names
+            goal_config = []
+            goal_jnames = []
+            for jname, jpos in zip(all_goal_jnames, all_goal_config):
+                if jname in active_joint_names:
+                    goal_jnames.append(jname)
+                    goal_config.append(jpos)
+            
+            self.get_logger().info(f'Filtered {len(goal_jnames)}/{len(all_goal_jnames)} joints for cumotion planning')
+
+            if len(goal_jnames) == 0:
+                self.get_logger().error('No joint constraints map to active cuMotion joints')
+                result.error_code.val = MoveItErrorCodes.INVALID_GOAL_CONSTRAINTS
+                return result
 
             goal_state = self.motion_gen.get_active_js(
                 CuJointState.from_position(
@@ -727,7 +749,7 @@ class CumotionActionServer(Node):
                     joint_names=goal_jnames,
                 )
             )
-            goal_pose = self.motion_gen.compute_kinematics(goal_state).ee_pose.clone()
+            plan_mode = "joint"
         elif (
             len(plan_req.goal_constraints[0].position_constraints) > 0
             and len(plan_req.goal_constraints[0].orientation_constraints) > 0
@@ -743,6 +765,11 @@ class CumotionActionServer(Node):
             position = [position.x, position.y, position.z]
             orientation = plan_req.goal_constraints[0].orientation_constraints[0].orientation
             orientation = [orientation.w, orientation.x, orientation.y, orientation.z]
+            
+            # Log target pose for debugging
+            self.get_logger().info(f'Target Position: x={position[0]:.4f}, y={position[1]:.4f}, z={position[2]:.4f}')
+            self.get_logger().info(f'Target Orientation (wxyz): w={orientation[0]:.4f}, x={orientation[1]:.4f}, y={orientation[2]:.4f}, z={orientation[3]:.4f}')
+            
             pose_list = position + orientation
             goal_pose = Pose.from_list(pose_list, tensor_args=self.tensor_args)
 
@@ -775,16 +802,33 @@ class CumotionActionServer(Node):
                 return result
         else:
             self.get_logger().error('Goal constraints not supported')
+            result = MoveGroup.Result()
+            result.error_code.val = MoveItErrorCodes.INVALID_GOAL_CONSTRAINTS
+            return result
         with self.lock:
             self.planner_busy = True
 
         self.motion_gen.reset(reset_seed=False)
-        motion_gen_result = self.motion_gen.plan_single(
-            start_state,
-            goal_pose,
-            MotionGenPlanConfig(max_attempts=self.__max_attempts, enable_graph_attempt=1,
-                                time_dilation_factor=time_dilation_factor),
-        )
+        if plan_mode == "joint":
+            motion_gen_result = self.motion_gen.plan_single_js(
+                start_state,
+                goal_state,
+                MotionGenPlanConfig(
+                    max_attempts=self.__max_attempts,
+                    enable_graph_attempt=1,
+                    time_dilation_factor=time_dilation_factor,
+                ),
+            )
+        else:
+            motion_gen_result = self.motion_gen.plan_single(
+                start_state,
+                goal_pose,
+                MotionGenPlanConfig(
+                    max_attempts=self.__max_attempts,
+                    enable_graph_attempt=1,
+                    time_dilation_factor=time_dilation_factor,
+                ),
+            )
         with self.lock:
             self.planner_busy = False
         result = MoveGroup.Result()
