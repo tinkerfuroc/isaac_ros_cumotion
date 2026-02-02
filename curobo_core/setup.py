@@ -43,6 +43,15 @@ from isaac_ros_common_version_info import GenerateVersionInfoCommand  # noqa: E4
 
 package_name = 'curobo_core'
 
+content_root = Path(__file__).parent / 'curobo' / 'src' / 'curobo' / 'content'
+content_files = []
+if content_root.exists():
+    content_files = [
+        str(path.relative_to(content_root.parent))
+        for path in content_root.rglob('*')
+        if path.is_file()
+    ]
+
 extra_cuda_args = {
     'nvcc': [
         '--threads=8',
