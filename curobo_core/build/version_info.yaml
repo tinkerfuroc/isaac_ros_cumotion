@@ -1,8 +1,7 @@
-build_datetime: '2025-10-01T20:38:06.245312'
-git_branch: release-3.2
-git_commit_date: 2025-05-08 18:20:13 -0700
-git_commit_hash: dbaa7e8264f6314f8baca516511414186ad1105d
-git_commit_message: Incorporate manual obstacles in Isaac Manipulator pick and place
-  workflow
-git_workspace_dirty: 'No'
+build_datetime: '2026-04-26T21:10:12.601832'
+git_branch: tinker
+git_commit_date: 2026-02-02 18:56:34 +0800
+git_commit_hash: e972428a2a3a49207e1e33f191f9e65686b21f19
+git_commit_message: 'feat: export curobo content'
+git_workspace_dirty: 'Yes'
 version: 3.2.5

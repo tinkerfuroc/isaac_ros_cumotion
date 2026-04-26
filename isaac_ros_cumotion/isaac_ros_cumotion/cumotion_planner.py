@@ -94,6 +94,11 @@ class CumotionActionServer(Node):
         self.declare_parameter('override_moveit_scaling_factors', False)
         self.declare_parameter('update_link_sphere_server',
                                'planner_attach_object')
+        self.declare_parameter('publish_iteration_trajectories', False)
+        self.declare_parameter('iteration_publish_stride', 1)
+        self.declare_parameter('iteration_animation_period_s', 1.0)
+        self.declare_parameter('trajectory_viz_topic', '/planned_trajectory_viz')
+        self.declare_parameter('trajectory_viz_frame', '')
         debug_mode = (
             self.get_parameter('enable_curobo_debug_mode').get_parameter_value().bool_value
         )
@@ -103,6 +108,37 @@ class CumotionActionServer(Node):
             setup_curobo_logger('warning')
 
         self.__voxel_pub = self.create_publisher(Marker, '/curobo/voxels', 10)
+
+        self._publish_iter_trajs = (
+            self.get_parameter('publish_iteration_trajectories')
+            .get_parameter_value().bool_value
+        )
+        stride = (
+            self.get_parameter('iteration_publish_stride')
+            .get_parameter_value().integer_value
+        )
+        self._iter_publish_stride = max(1, stride)
+        self._iter_animation_period = max(
+            0.0,
+            self.get_parameter('iteration_animation_period_s')
+            .get_parameter_value().double_value,
+        )
+        traj_viz_topic = (
+            self.get_parameter('trajectory_viz_topic')
+            .get_parameter_value().string_value
+        )
+        self._traj_viz_frame_override = (
+            self.get_parameter('trajectory_viz_frame')
+            .get_parameter_value().string_value
+        )
+        # Generous queue depth: a single plan publishes (per-iter overlays + final)
+        # all back-to-back, and rviz with reliable QoS will drop messages if the
+        # publisher buffer overflows.
+        self._traj_viz_pub = self.create_publisher(Marker, traj_viz_topic, 200)
+        self._traj_viz_iter_count = 0
+        self._traj_viz_anim_thread = None
+        self._traj_viz_anim_stop = threading.Event()
+        self._traj_viz_lock = threading.Lock()
         self.planner_busy = False
         self.lock = threading.Lock()
 
@@ -329,6 +365,8 @@ class CumotionActionServer(Node):
             collision_checker_type=CollisionCheckerType.VOXEL,
             ee_link_name=self.__tool_frame,
             finetune_trajopt_iters=self.__trajopt_finetune_iters,
+            store_trajopt_debug=self._publish_iter_trajs,
+            use_cuda_graph=not self._publish_iter_trajs,
         )
 
         motion_gen = MotionGen(motion_gen_config)
@@ -643,6 +681,7 @@ class CumotionActionServer(Node):
             result.error_code.val = MoveItErrorCodes.FAILURE
             return result
 
+        self._clear_traj_viz()
         self.get_logger().info('Executing goal...')
 
         # check moveit scaling factors:
@@ -840,6 +879,12 @@ class CumotionActionServer(Node):
             )
             result.planning_time = motion_gen_result.total_time
             result.planned_trajectory = traj
+            try:
+                self._publish_trajectory_visualization(motion_gen_result)
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warn(
+                    f'trajectory viz publish failed: {exc}'
+                )
         elif not motion_gen_result.valid_query:
             self.get_logger().error(
                 f'Invalid planning query: {motion_gen_result.status}'
@@ -858,6 +903,14 @@ class CumotionActionServer(Node):
             )
             if motion_gen_result.status == MotionGenStatus.IK_FAIL:
                 result.error_code.val = MoveItErrorCodes.NO_IK_SOLUTION
+            try:
+                self._publish_trajectory_visualization(
+                    motion_gen_result, success=False
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warn(
+                    f'trajectory viz (failed plan) publish failed: {exc}'
+                )
 
         self.get_logger().info(
             'returned planning result (query, success, failure_status): '
@@ -869,6 +922,254 @@ class CumotionActionServer(Node):
         )
         self.__query_count += 1
         return result
+
+    def _tcp_points_from_q(self, q_tensor):
+        # q_tensor: [..., dof] torch tensor on planner device
+        flat = q_tensor.reshape(-1, q_tensor.shape[-1])
+        flat = flat.to(dtype=self.tensor_args.dtype, device=self.tensor_args.device)
+        state = self.motion_gen.kinematics.get_state(flat)
+        ee = state.ee_position.detach().cpu().numpy()
+        pts = []
+        for i in range(ee.shape[0]):
+            p = Point()
+            p.x = float(ee[i, 0])
+            p.y = float(ee[i, 1])
+            p.z = float(ee[i, 2])
+            pts.append(p)
+        return pts
+
+    def _make_traj_marker(self, ns, marker_id, points, rgb, width=0.005):
+        marker = Marker()
+        frame = (
+            self._traj_viz_frame_override
+            if self._traj_viz_frame_override
+            else self._CumotionActionServer__robot_base_frame
+        )
+        marker.header.frame_id = frame
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = ns
+        marker.id = marker_id
+        marker.type = Marker.LINE_STRIP
+        marker.action = Marker.ADD
+        marker.scale.x = width
+        marker.pose.orientation.w = 1.0
+        marker.color.r = float(rgb[0])
+        marker.color.g = float(rgb[1])
+        marker.color.b = float(rgb[2])
+        marker.color.a = 1.0
+        marker.points = points
+        return marker
+
+    def _clear_traj_viz(self):
+        # Called at the start of every plan: stop any in-flight animation from
+        # the previous plan and tell rviz to drop every marker on the viz
+        # topic (DELETEALL covers all namespaces, so iter overlays + final
+        # marker are cleared in one shot).
+        with self._traj_viz_lock:
+            self._traj_viz_anim_stop.set()
+            if (
+                self._traj_viz_anim_thread is not None
+                and self._traj_viz_anim_thread.is_alive()
+            ):
+                self._traj_viz_anim_thread.join(timeout=0.1)
+            self._traj_viz_anim_thread = None
+            self._traj_viz_anim_stop = threading.Event()
+        self._traj_viz_iter_count = 0
+        m = Marker()
+        m.header.frame_id = self._CumotionActionServer__robot_base_frame
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.action = Marker.DELETEALL
+        self._traj_viz_pub.publish(m)
+
+    def _publish_trajectory_visualization(self, motion_gen_result, success=True):
+        # Pre-compute everything on the planner thread (we need access to
+        # motion_gen.kinematics for FK), then hand off to a worker that
+        # staggers the publishes so rviz sees them appear progressively.
+
+        iter_pts_list = []
+        if self._publish_iter_trajs:
+            debug = getattr(motion_gen_result, 'debug_info', None)
+            iters = self._extract_iter_q_list(debug)
+            if iters:
+                stride = self._iter_publish_stride
+                selected = iters[::stride]
+                if selected and selected[-1] is not iters[-1]:
+                    selected.append(iters[-1])
+                for q_iter in selected:
+                    if q_iter.dim() == 3:
+                        q_iter = q_iter[0]
+                    pts = self._tcp_points_from_q(q_iter)
+                    if len(pts) >= 2:
+                        iter_pts_list.append(pts)
+
+        opt_plan = getattr(motion_gen_result, 'optimized_plan', None)
+        final_pts = None
+        if opt_plan is not None and opt_plan.position is not None:
+            q = opt_plan.position
+            if q.dim() == 3:
+                q = q[0]
+            pts = self._tcp_points_from_q(q)
+            if len(pts) >= 2:
+                final_pts = pts
+        else:
+            self.get_logger().warn(
+                'traj viz: motion_gen_result has no optimized_plan'
+            )
+
+        prev_iter = self._traj_viz_iter_count
+        iter_n = len(iter_pts_list)
+        self._traj_viz_iter_count = iter_n
+        rgb_final = (0.0, 1.0, 0.0) if success else (1.0, 0.0, 0.0)
+        self.get_logger().info(
+            f'traj viz: {"SUCCESS" if success else "FAILED"} '
+            f'final={"yes" if final_pts is not None else "no"} '
+            f'iters={iter_n} (animation {self._iter_animation_period:.2f}s)'
+        )
+
+        # Stop any in-flight animation from a previous plan.
+        with self._traj_viz_lock:
+            self._traj_viz_anim_stop.set()
+            if (
+                self._traj_viz_anim_thread is not None
+                and self._traj_viz_anim_thread.is_alive()
+            ):
+                self._traj_viz_anim_thread.join(timeout=0.1)
+            self._traj_viz_anim_stop = threading.Event()
+            stop_evt = self._traj_viz_anim_stop
+            self._traj_viz_anim_thread = threading.Thread(
+                target=self._animate_traj_viz,
+                args=(iter_pts_list, prev_iter, final_pts, rgb_final, stop_evt),
+                daemon=True,
+            )
+            self._traj_viz_anim_thread.start()
+
+    def _animate_traj_viz(
+        self, iter_pts_list, prev_iter, final_pts, rgb_final, stop_evt
+    ):
+        n = len(iter_pts_list)
+        period = self._iter_animation_period
+        dt = (period / n) if n > 0 and period > 0 else 0.0
+        for idx, pts in enumerate(iter_pts_list):
+            if stop_evt.is_set():
+                return
+            self._traj_viz_pub.publish(
+                self._make_traj_marker(
+                    'cumotion_iter', idx, pts,
+                    (1.0, 1.0, 0.0),  # yellow = optimization process
+                    width=0.003,
+                )
+            )
+            if dt > 0.0 and idx < n - 1:
+                stop_evt.wait(dt)
+
+        # Delete leftover iter markers from a previous longer plan.
+        if prev_iter > n:
+            for i in range(n, prev_iter):
+                if stop_evt.is_set():
+                    return
+                m = Marker()
+                m.header.frame_id = self._CumotionActionServer__robot_base_frame
+                m.header.stamp = self.get_clock().now().to_msg()
+                m.ns = 'cumotion_iter'
+                m.id = i
+                m.action = Marker.DELETE
+                self._traj_viz_pub.publish(m)
+
+        # Final trajectory drawn last (green=success, red=failure).
+        if final_pts is not None and not stop_evt.is_set():
+            self._traj_viz_pub.publish(
+                self._make_traj_marker(
+                    'cumotion_planned', 0, final_pts, rgb_final, width=0.006,
+                )
+            )
+
+    def _extract_iter_q_list(self, debug):
+        # Pull per-iter best_q tensors out of curobo's nested debug structure.
+        # Real shape (curobo 0.7.x):
+        #   motion_gen_result.debug_info
+        #     = {"trajopt_result": TrajOptResult}
+        #   TrajOptResult.debug_info
+        #     = {"solver": WrapResult.debug, ...}
+        #   WrapResult.debug
+        #     = {"steps": [particle_opt.debug, newton_opt.debug], "cost": [...]}
+        #   newton_opt.debug
+        #     = [tensor[bs*seeds, horizon, dof], tensor, ...]   <- what we want
+        #
+        # The walker must avoid sweeping in unrelated tensors that *also* live
+        # on TrajOptResult (e.g. `seed`, `solution.position`, `raw_solution`,
+        # `metrics.*`, `goal.*`) — those are full-batch tensors of every seed,
+        # and turning them into LINE_STRIPs paints "random" yellow lines.
+        # We accept ONLY lists/tuples of trajectory-shaped tensors:
+        #   tensor.shape[-1] == dof  AND  tensor.shape[-2] >= 2
+        # which is exactly the convention NewtonOptBase uses for `self.debug`.
+        out = []
+        if debug is None:
+            self.get_logger().warn('traj viz: debug_info is None')
+            return out
+
+        try:
+            dof = len(self.motion_gen.kinematics.joint_names)
+        except Exception:  # noqa: BLE001
+            dof = None
+
+        def is_traj_tensor(t):
+            return (
+                torch.is_tensor(t)
+                and t.dim() >= 2
+                and t.shape[-2] >= 2
+                and (dof is None or t.shape[-1] == dof)
+            )
+
+        seen_lists = 0
+        seen_dicts = 0
+        seen_objs = 0
+        visited_ids = set()
+
+        def visit(obj):
+            nonlocal seen_lists, seen_dicts, seen_objs
+            if obj is None or isinstance(obj, (str, bytes, int, float, bool)):
+                return
+            oid = id(obj)
+            if oid in visited_ids:
+                return
+            visited_ids.add(oid)
+            if isinstance(obj, (list, tuple)):
+                seen_lists += 1
+                # Only treat this list as a per-iter snapshot list if every
+                # element is a trajectory-shaped tensor. Otherwise descend.
+                if obj and all(is_traj_tensor(x) for x in obj):
+                    out.extend(obj)
+                else:
+                    for item in obj:
+                        visit(item)
+            elif isinstance(obj, dict):
+                seen_dicts += 1
+                for v in obj.values():
+                    visit(v)
+            elif torch.is_tensor(obj):
+                # Don't unwrap bare tensors — they are usually full-batch
+                # solutions/seeds, not per-iter snapshots.
+                return
+            elif hasattr(obj, '__dataclass_fields__'):
+                seen_objs += 1
+                # For dataclasses (e.g. TrajOptResult) descend ONLY through
+                # `debug_info`. The other fields hold final/seed/metric tensors
+                # that aren't iteration progress.
+                if hasattr(obj, 'debug_info'):
+                    visit(getattr(obj, 'debug_info'))
+            elif hasattr(obj, '__dict__'):
+                seen_objs += 1
+                if 'debug_info' in vars(obj):
+                    visit(vars(obj)['debug_info'])
+                elif 'debug' in vars(obj):
+                    visit(vars(obj)['debug'])
+
+        visit(debug)
+        self.get_logger().info(
+            f'traj viz: extracted {len(out)} iter snapshots '
+            f'(visited {seen_lists} lists, {seen_dicts} dicts, {seen_objs} objs)'
+        )
+        return out
 
     def publish_voxels(self, voxels):
         vox_size = self.__publish_voxel_size

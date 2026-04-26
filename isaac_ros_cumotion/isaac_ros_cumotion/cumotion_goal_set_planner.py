@@ -91,6 +91,7 @@ class CumotionGoalSetPlannerServer(CumotionActionServer):
         return True, MoveItErrorCodes.SUCCESS, goal_pose
 
     def motion_plan_execute_callback(self, goal_handle):
+        self._clear_traj_viz()
         self.get_logger().info('Executing goal...')
         pose_cost_metric = None
 
@@ -200,9 +201,71 @@ class CumotionGoalSetPlannerServer(CumotionActionServer):
                     result.planned_trajectory.append(traj)
                 result.success = True
                 result.goal_index = grasp_plan_result.goalset_index.item()
+                try:
+                    # plan_grasp's result has grasp_trajectory (and optionally
+                    # retract_trajectory) instead of optimized_plan, so
+                    # synthesize an object the helper understands.
+                    parts = [grasp_plan_result.grasp_trajectory]
+                    if plan_req.plan_grasp_to_retract:
+                        parts.append(grasp_plan_result.retract_trajectory)
+                    import torch as _torch
+                    pos = _torch.cat(
+                        [p.position.reshape(-1, p.position.shape[-1]) for p in parts],
+                        dim=0,
+                    )
+
+                    class _Shim:
+                        pass
+                    shim_plan = _Shim()
+                    shim_plan.position = pos
+                    shim_result = _Shim()
+                    shim_result.optimized_plan = shim_plan
+                    shim_result.debug_info = getattr(
+                        grasp_plan_result, 'debug_info', None
+                    )
+                    self._publish_trajectory_visualization(shim_result)
+                except Exception as exc:  # noqa: BLE001
+                    self.get_logger().warn(
+                        f'trajectory viz publish failed (plan_grasp): {exc}'
+                    )
             else:
                 result.success = False
                 result.message = grasp_plan_result.status
+                try:
+                    parts = []
+                    gt = getattr(grasp_plan_result, 'grasp_trajectory', None)
+                    if gt is not None and getattr(gt, 'position', None) is not None:
+                        parts.append(gt)
+                    rt = getattr(grasp_plan_result, 'retract_trajectory', None)
+                    if (
+                        plan_req.plan_grasp_to_retract
+                        and rt is not None
+                        and getattr(rt, 'position', None) is not None
+                    ):
+                        parts.append(rt)
+                    if parts:
+                        import torch as _torch
+                        pos = _torch.cat(
+                            [p.position.reshape(-1, p.position.shape[-1]) for p in parts],
+                            dim=0,
+                        )
+
+                        class _Shim:
+                            pass
+                        shim_plan = _Shim()
+                        shim_plan.position = pos
+                        shim_result = _Shim()
+                        shim_result.optimized_plan = shim_plan
+                        shim_result.debug_info = getattr(
+                            grasp_plan_result, 'debug_info', None
+                        )
+                        self._publish_trajectory_visualization(
+                            shim_result, success=False
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    self.get_logger().warn(
+                        f'trajectory viz (failed plan_grasp) publish failed: {exc}'
+                    )
         else:
             if plan_req.plan_cspace:
                 self.get_logger().info('Planning CSpace target')
@@ -285,6 +348,12 @@ class CumotionGoalSetPlannerServer(CumotionActionServer):
                 result.planned_trajectory.append(traj)
                 result.success = True
                 result.goal_index = motion_gen_result.goalset_index.item()
+                try:
+                    self._publish_trajectory_visualization(motion_gen_result)
+                except Exception as exc:  # noqa: BLE001
+                    self.get_logger().warn(
+                        f'trajectory viz publish failed: {exc}'
+                    )
             elif not motion_gen_result.valid_query:
                 self.get_logger().error(f'Invalid planning query: {motion_gen_result.status}')
                 if motion_gen_result.status == MotionGenStatus.INVALID_START_STATE_JOINT_LIMITS:
@@ -308,6 +377,14 @@ class CumotionGoalSetPlannerServer(CumotionActionServer):
                         self.get_logger().warn(f'Position Error: {motion_gen_result.position_error}')
                     if hasattr(motion_gen_result, 'rotation_error'):
                         self.get_logger().warn(f'Rotation Error: {motion_gen_result.rotation_error}')
+                try:
+                    self._publish_trajectory_visualization(
+                        motion_gen_result, success=False
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self.get_logger().warn(
+                        f'trajectory viz (failed plan) publish failed: {exc}'
+                    )
 
             self.get_logger().info(
                 'returned planning result (query, success, failure_status): '
