@@ -65,11 +65,18 @@ class CumotionActionServer(Node):
         self.declare_parameter('time_dilation_factor', 0.5)
         self.declare_parameter('max_attempts', 10)
         self.declare_parameter('num_graph_seeds', 6)
+        # graph_file: optional override for curobo's graph-search config (cspace PRM +
+        # steering). Empty string => use curobo's default graph.yml (upstream behaviour).
+        # Non-empty => absolute path resolved by launch; passed straight into
+        # MotionGenConfig.load_from_robot_config(graph_file=...). Used to tune
+        # base_dt / steer_delta_buffer when graph search returns through-collision paths.
+        self.declare_parameter('graph_file', '')
         self.declare_parameter('num_trajopt_seeds', 6)
         self.declare_parameter('include_trajopt_retract_seed', True)
         self.declare_parameter('num_trajopt_time_steps', 32)
         self.declare_parameter('trajopt_finetune_iters', 400)
         self.declare_parameter('interpolation_dt', 0.025)
+        self.declare_parameter('maximum_trajectory_dt', 0.15)
         self.declare_parameter('collision_cache_mesh', 20)
         self.declare_parameter('collision_cache_cuboid', 20)
         self.declare_parameter('voxel_size', 0.05)
@@ -189,6 +196,9 @@ class CumotionActionServer(Node):
         self.__num_graph_seeds = (
             self.get_parameter('num_graph_seeds').get_parameter_value().integer_value
         )
+        self.__graph_file = (
+            self.get_parameter('graph_file').get_parameter_value().string_value
+        )
         self.__num_trajopt_seeds = (
             self.get_parameter('num_trajopt_seeds').get_parameter_value().integer_value
         )
@@ -200,6 +210,9 @@ class CumotionActionServer(Node):
         )
         self.__interpolation_dt = (
             self.get_parameter('interpolation_dt').get_parameter_value().double_value
+        )
+        self.__maximum_trajectory_dt = (
+            self.get_parameter('maximum_trajectory_dt').get_parameter_value().double_value
         )
 
         include_trajopt_retract_seed = (
@@ -351,6 +364,13 @@ class CumotionActionServer(Node):
         )
 
         robot_dict = robot_config['robot_cfg']
+        graph_file_kwargs = (
+            {'graph_file': self.__graph_file} if self.__graph_file else {}
+        )
+        if self.__graph_file:
+            self.get_logger().info(
+                f'cuMotion graph search using override config: {self.__graph_file}'
+            )
         motion_gen_config = MotionGenConfig.load_from_robot_config(
             robot_dict,
             world_file,
@@ -361,12 +381,14 @@ class CumotionActionServer(Node):
             trajopt_tsteps=self.__num_trajopt_time_steps,
             trajopt_seed_ratio=self.__trajopt_seed_ratio,
             interpolation_dt=self.__interpolation_dt,
+            maximum_trajectory_dt=self.__maximum_trajectory_dt,
             collision_cache=self.__collision_cache,
             collision_checker_type=CollisionCheckerType.VOXEL,
             ee_link_name=self.__tool_frame,
             finetune_trajopt_iters=self.__trajopt_finetune_iters,
             store_trajopt_debug=self._publish_iter_trajs,
             use_cuda_graph=not self._publish_iter_trajs,
+            **graph_file_kwargs,
         )
 
         motion_gen = MotionGen(motion_gen_config)
