@@ -151,6 +151,16 @@ class CumotionActionServer(Node):
         self.declare_parameter('num_trajopt_time_steps', 32)
         self.declare_parameter('trajopt_finetune_iters', 400)
         self.declare_parameter('interpolation_dt', 0.025)
+        # Interpolated-trajectory buffer length (steps). curobo's default is
+        # 5000; collision / self-collision / FK metric buffers are allocated
+        # at batch x interpolation_steps x n_spheres, which makes this the
+        # planner's largest VRAM knob (measured 6.3 GB -> 2.5 GB going
+        # 5000 -> 1024 with 275 spheres, zero latency change). Required
+        # length = num_trajopt_time_steps * maximum_trajectory_dt /
+        # interpolation_dt (384 on the production config; worst case ~480
+        # with finetune dt relaxation). On overflow curobo grows the buffer
+        # and re-captures CUDA graphs (one-time latency blip, not a failure).
+        self.declare_parameter('interpolation_steps', 5000)
         self.declare_parameter('maximum_trajectory_dt', 0.15)
         self.declare_parameter('collision_cache_mesh', 20)
         self.declare_parameter('collision_cache_cuboid', 20)
@@ -285,6 +295,10 @@ class CumotionActionServer(Node):
         )
         self.__interpolation_dt = (
             self.get_parameter('interpolation_dt').get_parameter_value().double_value
+        )
+        self.__interpolation_steps = (
+            self.get_parameter('interpolation_steps')
+            .get_parameter_value().integer_value
         )
         self.__maximum_trajectory_dt = (
             self.get_parameter('maximum_trajectory_dt').get_parameter_value().double_value
@@ -463,6 +477,7 @@ class CumotionActionServer(Node):
             trajopt_tsteps=self.__num_trajopt_time_steps,
             trajopt_seed_ratio=self.__trajopt_seed_ratio,
             interpolation_dt=self.__interpolation_dt,
+            interpolation_steps=self.__interpolation_steps,
             maximum_trajectory_dt=self.__maximum_trajectory_dt,
             collision_cache=self.__collision_cache,
             collision_checker_type=CollisionCheckerType.VOXEL,
