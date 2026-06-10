@@ -54,10 +54,85 @@ from trajectory_msgs.msg import JointTrajectoryPoint
 from visualization_msgs.msg import Marker
 
 
+def _mem_report(node, tag):
+    """Intra-process GPU memory breakdown (gated by CUMOTION_MEM_PROFILE env).
+
+    Decomposes the single per-PID number nvtop/NVML reports into:
+      live_tensors  = torch.cuda.memory_allocated  (tensors actually in use)
+      torch_pool    = torch.cuda.memory_reserved    (torch caching allocator)
+      slack         = torch_pool - live_tensors     (reserved-but-unused)
+      ctx+libs+graphs = NVML_total - torch_pool      (CUDA context, cuBLAS/cuDNN
+                        cubins, Warp kernels, non-torch CUDA-graph pools) — the
+                        part torch's own counters (and thus any external tool) miss.
+    No-op unless CUMOTION_MEM_PROFILE is set, so it never affects normal runs.
+    """
+    import os
+    if not os.environ.get('CUMOTION_MEM_PROFILE'):
+        return
+    import subprocess
+    try:
+        torch.cuda.synchronize()
+        alloc = torch.cuda.memory_allocated() / 2**20
+        resv = torch.cuda.memory_reserved() / 2**20
+        total = float('nan')
+        pid = os.getpid()
+        out = subprocess.run(
+            ['nvidia-smi', '--query-compute-apps=pid,used_memory',
+             '--format=csv,noheader,nounits'],
+            capture_output=True, text=True, timeout=5).stdout
+        for line in out.strip().splitlines():
+            parts = [p.strip() for p in line.split(',')]
+            if len(parts) == 2 and parts[0].isdigit() and int(parts[0]) == pid:
+                total = float(parts[1])
+                break
+        node.get_logger().info(
+            f'[MEMPROF {tag}] live_tensors={alloc:.0f}MB '
+            f'torch_pool={resv:.0f}MB(slack={resv - alloc:.0f}) '
+            f'nvsmi_total={total:.0f}MB ctx+libs+graphs={total - resv:.0f}MB')
+    except Exception as e:  # profiling must never break the node
+        node.get_logger().warn(f'[MEMPROF {tag}] failed: {e}')
+
+
+def _record_mem_history():
+    """Start torch's allocation recorder (gated by CUMOTION_MEM_SNAPSHOT).
+
+    Every subsequent cudaMalloc is tagged with its Python call stack, so a later
+    _dump_snapshot lets us attribute live VRAM to the *function* that allocated
+    it — the 'which function uses the most GPU memory' question. Call as early as
+    possible so no allocation is missed."""
+    import os
+    if not os.environ.get('CUMOTION_MEM_SNAPSHOT'):
+        return
+    try:
+        torch.cuda.memory._record_memory_history(max_entries=200000)
+    except TypeError:  # older torch signature
+        try:
+            torch.cuda.memory._record_memory_history(True)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _dump_mem_snapshot(node, path):
+    """Pickle the allocation snapshot to `path` (gated by CUMOTION_MEM_SNAPSHOT).
+    Analyze offline with scripts/analyze_cumotion_snapshot.py (no GPU needed)."""
+    import os
+    if not os.environ.get('CUMOTION_MEM_SNAPSHOT'):
+        return
+    try:
+        torch.cuda.memory._dump_snapshot(path)
+        node.get_logger().info(f'[MEMSNAP] dumped {path}')
+    except Exception as e:
+        node.get_logger().warn(f'[MEMSNAP] dump failed: {e}')
+
+
 class CumotionActionServer(Node):
 
     def __init__(self):
         super().__init__('cumotion_action_server')
+        _mem_report(self, '00_init_start')
+        _record_mem_history()
         self.tensor_args = TensorDeviceType()
         self.declare_parameter('robot', 'ur5e.yml')
         self.declare_parameter('urdf_path', rclpy.Parameter.Type.STRING)
@@ -308,7 +383,14 @@ class CumotionActionServer(Node):
             self.__esdf_req = EsdfAndGradients.Request()
 
         self.load_motion_gen()
+        _mem_report(self, '01_after_load_motion_gen')
         self.warmup()
+        _mem_report(self, '02_after_warmup')
+        _dump_mem_snapshot(self, '/tmp/cumotion_mem_after_warmup.pickle')
+        self.__mem_snap_after_plan_done = False
+        # Periodic sampler captures the steady state + the step-up the first real
+        # plan adds (CUDA-graph capture + trajopt/MPPI peak the allocator pins).
+        self.create_timer(5.0, lambda: _mem_report(self, 'periodic'))
         self.__query_count = 0
         self.__tensor_args = self.motion_gen.tensor_args
         self.subscription = self.create_subscription(
@@ -892,6 +974,12 @@ class CumotionActionServer(Node):
             )
         with self.lock:
             self.planner_busy = False
+        # One-shot snapshot after the first real plan — captures any allocation
+        # the goal-set plan adds on top of warmup (CUDA graphs for the actual
+        # problem shapes). No-op unless CUMOTION_MEM_SNAPSHOT is set.
+        if not self.__mem_snap_after_plan_done:
+            self.__mem_snap_after_plan_done = True
+            _dump_mem_snapshot(self, '/tmp/cumotion_mem_after_first_plan.pickle')
         result = MoveGroup.Result()
         if motion_gen_result.success.item():
             result.error_code.val = MoveItErrorCodes.SUCCESS

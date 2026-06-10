@@ -41,16 +41,61 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 
+def _mem_report(node, tag):
+    """Intra-process GPU memory breakdown (gated by CUMOTION_MEM_PROFILE env).
+
+    Decomposes the single per-PID number nvtop/NVML reports into:
+      live_tensors  = torch.cuda.memory_allocated  (tensors actually in use)
+      torch_pool    = torch.cuda.memory_reserved    (torch caching allocator)
+      slack         = torch_pool - live_tensors     (reserved-but-unused)
+      ctx+libs+graphs = NVML_total - torch_pool      (CUDA context, cuBLAS/cuDNN
+                        cubins, Warp kernels, non-torch CUDA-graph pools) — the
+                        part torch's own counters (and thus any external tool) miss.
+    No-op unless CUMOTION_MEM_PROFILE is set, so it never affects normal runs.
+    """
+    import os
+    if not os.environ.get('CUMOTION_MEM_PROFILE'):
+        return
+    import subprocess
+    try:
+        torch.cuda.synchronize()
+        alloc = torch.cuda.memory_allocated() / 2**20
+        resv = torch.cuda.memory_reserved() / 2**20
+        total = float('nan')
+        pid = os.getpid()
+        out = subprocess.run(
+            ['nvidia-smi', '--query-compute-apps=pid,used_memory',
+             '--format=csv,noheader,nounits'],
+            capture_output=True, text=True, timeout=5).stdout
+        for line in out.strip().splitlines():
+            parts = [p.strip() for p in line.split(',')]
+            if len(parts) == 2 and parts[0].isdigit() and int(parts[0]) == pid:
+                total = float(parts[1])
+                break
+        node.get_logger().info(
+            f'[MEMPROF {tag}] live_tensors={alloc:.0f}MB '
+            f'torch_pool={resv:.0f}MB(slack={resv - alloc:.0f}) '
+            f'nvsmi_total={total:.0f}MB ctx+libs+graphs={total - resv:.0f}MB')
+    except Exception as e:  # profiling must never break the node
+        node.get_logger().warn(f'[MEMPROF {tag}] failed: {e}')
+
+
 class CumotionRobotSegmenter(Node):
     """This node filters out depth pixels assosiated with a robot body using a mask."""
 
     def __init__(self):
         super().__init__('cumotion_robot_segmentation')
+        _mem_report(self, '00_init_start')
         self.declare_parameter('robot', 'ur5e.yml')
         self.declare_parameter('urdf_path', rclpy.Parameter.Type.STRING)
         self.declare_parameter('yml_file_path', rclpy.Parameter.Type.STRING)
         self.declare_parameter('cuda_device', 0)
         self.declare_parameter('distance_threshold', 0.1)
+        # use_cuda_graph captures the masking kernels into a CUDA graph for speed,
+        # but that pins a multi-GB pool sized for the full-res depth peak (measured
+        # ~3.9GB) that the caching allocator can never release. Set False to trade
+        # a little per-frame latency for that VRAM. See scripts/ GPU profiling.
+        self.declare_parameter('use_cuda_graph', True)
         self.declare_parameter('time_sync_slop', 0.1)
         self.declare_parameter('tf_lookup_duration', 5.0)
 
@@ -190,8 +235,14 @@ class CumotionRobotSegmenter(Node):
             logger=self.get_logger()
         )
 
+        seg_use_cuda_graph = self.get_parameter(
+            'use_cuda_graph').get_parameter_value().bool_value
         self._cumotion_segmenter = RobotSegmenter.from_robot_file(
-            robot_config, distance_threshold=distance_threshold)
+            robot_config, distance_threshold=distance_threshold,
+            use_cuda_graph=seg_use_cuda_graph)
+        self.get_logger().info(
+            f'RobotSegmenter use_cuda_graph={seg_use_cuda_graph}')
+        _mem_report(self, '01_after_robot_world_load')
 
         self._cumotion_base_frame = self._cumotion_segmenter.base_link
 
@@ -204,6 +255,8 @@ class CumotionRobotSegmenter(Node):
 
         self._robot_pose_cameras = None
         self.get_logger().info(f'Node initialized with {self._num_cameras} cameras')
+        _mem_report(self, '02_init_done')
+        self.create_timer(5.0, lambda: _mem_report(self, 'periodic'))
 
     def process_depth_and_joint_state(self, *msgs):
         self._depth_buffers = []
