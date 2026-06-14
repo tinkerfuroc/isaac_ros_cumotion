@@ -166,6 +166,13 @@ class CumotionActionServer(Node):
         self.declare_parameter('collision_cache_cuboid', 20)
         self.declare_parameter('voxel_size', 0.05)
         self.declare_parameter('read_esdf_world', False)
+        # plan_on_empty_esdf: when read_esdf_world is on and the ESDF service
+        # returns an all-unobserved grid (nothing within nvblox integration
+        # range -> the workspace is genuinely clear), plan against an
+        # obstacle-free voxel world instead of aborting. Default False keeps
+        # upstream behavior (abort + retry, appropriate during sensor warmup);
+        # set True for a robot that must stay drivable in open space.
+        self.declare_parameter('plan_on_empty_esdf', False)
         self.declare_parameter('publish_curobo_world_as_voxels', False)
         self.declare_parameter('add_ground_plane', False)
         self.declare_parameter('publish_voxel_size', 0.05)
@@ -329,6 +336,9 @@ class CumotionActionServer(Node):
 
         self.__read_esdf_grid = (
             self.get_parameter('read_esdf_world').get_parameter_value().bool_value
+        )
+        self.__plan_on_empty_esdf = (
+            self.get_parameter('plan_on_empty_esdf').get_parameter_value().bool_value
         )
         self.__publish_curobo_world_as_voxels = (
             self.get_parameter('publish_curobo_world_as_voxels').get_parameter_value().bool_value
@@ -542,8 +552,23 @@ class CumotionActionServer(Node):
             return False
         esdf_grid = self.get_esdf_voxel_grid(response)
         if torch.max(esdf_grid.feature_tensor) <= (-1000.0 + 0.5 * self.__voxel_size + 1e-5):
-            self.get_logger().error('ESDF data is empty, try again after few seconds.')
-            return False
+            # Every voxel is the nvblox "unobserved" sentinel. Two causes look
+            # identical here: (a) the workspace is genuinely clear (nothing
+            # within projective_integrator_max_integration_distance_m of the
+            # wrist cam), or (b) the sensor/service is still warming up. The
+            # call itself succeeded, so this is not a service failure.
+            if not self.__plan_on_empty_esdf:
+                self.get_logger().error('ESDF data is empty, try again after few seconds.')
+                return False
+            # plan_on_empty_esdf: treat empty as a clear world. get_esdf_voxel_grid
+            # maps the sentinel to a large free distance, and curobo already
+            # treats unobserved voxels as free in every partial grid it builds,
+            # so feeding the all-free grid through is consistent (not new unsafe
+            # behavior) -- it also clears any stale obstacle from the prior plan.
+            # Self-collision and PlanningScene collision objects still apply.
+            self.get_logger().warn(
+                'ESDF empty (nothing within nvblox integration range); '
+                'planning against an obstacle-free voxel world.')
         self.__world_collision.update_voxel_data(esdf_grid)
         self.get_logger().info('Updated ESDF grid')
         return True
