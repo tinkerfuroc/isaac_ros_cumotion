@@ -149,7 +149,7 @@ class CumotionGoalSetClient:
         goal_msg.use_current_state = True
         if start_state is not None:
             goal_msg.use_current_state = False
-            goal_msg.start_state.position = start_state.position.cpu().flatten().to_list()
+            goal_msg.start_state.position = start_state.position.cpu().flatten().tolist()
             goal_msg.start_state.name = start_state.joint_names
 
         goal_msg.use_planning_scene = update_planning_scene
@@ -224,7 +224,7 @@ class CumotionGoalSetClient:
         goal_msg.use_current_state = True
         if start_state is not None:
             goal_msg.use_current_state = False
-            goal_msg.start_state.position = start_state.position.cpu().flatten().to_list()
+            goal_msg.start_state.position = start_state.position.cpu().flatten().tolist()
             goal_msg.start_state.name = start_state.joint_names
 
         goal_msg.use_planning_scene = update_planning_scene
