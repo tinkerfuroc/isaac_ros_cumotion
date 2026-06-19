@@ -14,6 +14,12 @@
     collision_cache_cuboid: 20
     collision_cache_mesh: 20
     workspace_file_path: ''
+    # NOTE: grid_size_m + voxel_size here are DEAD for the production grasp path.
+    # Only the upstream NVIDIA isaac_ros_cumotion.launch.py reads this file. The
+    # Tinker grasp/cumotion path sources every planner param (including voxel_size
+    # = 0.02 and grid_size_m) from cumotion_description/config/planner.yml via
+    # _robot_moveit_common2_cumotion.launch.py. Changing the two values below has
+    # NO effect on grasping — edit planner.yml instead.
     grid_size_m: [2.0, 2.0, 2.0]
     voxel_size: 0.05
     read_esdf_world: False
