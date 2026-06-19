@@ -781,7 +781,10 @@ class CumotionActionServer(Node):
             cylinder_list = []
             mesh_list = []
             for i, obj in enumerate(moveit_objects):
-                cumotion_objects, world_update_status = self.get_cumotion_collision_object(obj)
+                cumotion_objects, obj_update_status = self.get_cumotion_collision_object(obj)
+                # Accumulate (don't overwrite): one unsupported primitive must not
+                # be masked by a later supported one.
+                world_update_status = world_update_status and obj_update_status
                 for cumotion_object in cumotion_objects:
                     if isinstance(cumotion_object, Cuboid):
                         cuboid_list.append(cumotion_object)
@@ -800,7 +803,11 @@ class CumotionActionServer(Node):
             ).get_collision_check_world()
             self.motion_gen.update_world(world_model)
         if self.__read_esdf_grid:
-            world_update_status = self.update_voxel_grid()
+            # AND, don't overwrite: a successful ESDF update must not mask a
+            # failed PlanningScene collision object (else we'd plan as if that
+            # object were absent). ESDF is the production default, so the old
+            # overwrite silently dropped any unsupported MoveIt primitive.
+            world_update_status = self.update_voxel_grid() and world_update_status
         if self.__publish_curobo_world_as_voxels:
             if self.__voxel_pub.get_subscription_count() > 0:
                 # Calculate occupancy and publish only when subscribed.

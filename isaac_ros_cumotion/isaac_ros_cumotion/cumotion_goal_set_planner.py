@@ -267,6 +267,7 @@ class CumotionGoalSetPlannerServer(CumotionActionServer):
                         f'trajectory viz (failed plan_grasp) publish failed: {exc}'
                     )
         else:
+            motion_gen_result = None
             if plan_req.plan_cspace:
                 self.get_logger().info('Planning CSpace target')
                 if len(plan_req.goal_state.position) <= 0:
@@ -339,6 +340,16 @@ class CumotionGoalSetPlannerServer(CumotionActionServer):
                     )
                 self.toggle_link_collision(plan_req.disable_collision_links, True)
 
+            if motion_gen_result is None:
+                # Neither plan_cspace nor plan_pose was set — there is nothing to
+                # plan. Reject explicitly instead of dereferencing an unbound
+                # motion_gen_result (which would crash the callback with no
+                # MoveItErrorCode set, leaving the goal handle dangling).
+                self.get_logger().error(
+                    'Goal-set request set neither plan_cspace nor plan_pose; '
+                    'rejecting (nothing to plan).')
+                result.error_code.val = MoveItErrorCodes.INVALID_GOAL_CONSTRAINTS
+                return result
             if motion_gen_result.success.item():
                 result.error_code.val = MoveItErrorCodes.SUCCESS
                 traj = self.get_joint_trajectory(
