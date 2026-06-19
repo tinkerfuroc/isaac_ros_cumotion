@@ -33,6 +33,9 @@ class CumotionGoalSetPlannerServer(CumotionActionServer):
 
     def warmup(self):
         self.get_logger().info('warming up cuMotion, wait until ready')
+        # n_goalset=100 is the upstream default. A 100->32 VRAM-budget probe
+        # measured flat (no savings) and was reverted -- see
+        # docs/superpowers/specs/2026-06-10-manip-vram-budget-design.md.
         self.motion_gen.warmup(enable_graph=True, n_goalset=100, warmup_js_trajopt=True)
         self.get_logger().info('cuMotion is ready for planning queries!')
 

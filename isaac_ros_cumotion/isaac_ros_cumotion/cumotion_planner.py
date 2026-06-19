@@ -558,7 +558,9 @@ class CumotionActionServer(Node):
             # wrist cam), or (b) the sensor/service is still warming up. The
             # call itself succeeded, so this is not a service failure.
             if not self.__plan_on_empty_esdf:
-                self.get_logger().error('ESDF data is empty, try again after few seconds.')
+                self.get_logger().error(
+                    'ESDF empty and plan_on_empty_esdf is false -- aborting; '
+                    'set plan_on_empty_esdf:=true to plan against a clear world.')
                 return False
             # plan_on_empty_esdf: treat empty as a clear world. get_esdf_voxel_grid
             # maps the sentinel to a large free distance, and curobo already
