@@ -96,7 +96,6 @@ class CumotionGoalSetPlannerServer(CumotionActionServer):
     def motion_plan_execute_callback(self, goal_handle):
         self._clear_traj_viz()
         self.get_logger().info('Executing goal...')
-        pose_cost_metric = None
 
         # check moveit scaling factors:
         time_dilation_factor = goal_handle.request.time_dilation_factor
@@ -105,7 +104,29 @@ class CumotionGoalSetPlannerServer(CumotionActionServer):
             self.get_logger().warn('Cannot set time_dilation_factor = 0.0')
         self.get_logger().info('Planning with time_dilation_factor: ' + str(time_dilation_factor))
 
+        # cuRobo MotionGen is shared with the move_group action and is not
+        # reentrant. Atomically reserve it before reset()/plan_* so a goalset
+        # plan can never run concurrently with a move_group plan (BUG B). The
+        # acquire is before succeed() so a busy-reject aborts a goal that was
+        # never succeeded.
+        if not self._try_acquire_planner():
+            self.get_logger().error('Planner is busy')
+            goal_handle.abort()
+            result = MotionPlan.Result()
+            result.success = False
+            result.error_code.val = MoveItErrorCodes.FAILURE
+            return result
+
         goal_handle.succeed()
+        try:
+            return self._run_motion_plan(goal_handle, time_dilation_factor)
+        finally:
+            # Always release, even if any reset()/plan_*/get_active_js call
+            # raises, so the planner never wedges 'busy' forever (BUG A).
+            self._release_planner()
+
+    def _run_motion_plan(self, goal_handle, time_dilation_factor):
+        pose_cost_metric = None
         self.motion_gen.reset(reset_seed=False)
 
         result = MotionPlan.Result()
@@ -284,17 +305,20 @@ class CumotionGoalSetPlannerServer(CumotionActionServer):
                     )
                 )
                 self.toggle_link_collision(plan_req.disable_collision_links, False)
-
-                motion_gen_result = self.motion_gen.plan_single_js(
-                    start_state,
-                    goal_state,
-                    MotionGenPlanConfig(
-                        max_attempts=self._CumotionActionServer__max_attempts,
-                        enable_graph_attempt=1,
-                        time_dilation_factor=time_dilation_factor,
-                    ),
-                )
-                self.toggle_link_collision(plan_req.disable_collision_links, True)
+                try:
+                    motion_gen_result = self.motion_gen.plan_single_js(
+                        start_state,
+                        goal_state,
+                        MotionGenPlanConfig(
+                            max_attempts=self._CumotionActionServer__max_attempts,
+                            enable_graph_attempt=1,
+                            time_dilation_factor=time_dilation_factor,
+                        ),
+                    )
+                finally:
+                    # Re-enable disabled links even if the plan raises, so the
+                    # next plan is not collision-blind on those links (BUG C).
+                    self.toggle_link_collision(plan_req.disable_collision_links, True)
 
             elif plan_req.plan_pose:
                 self.get_logger().info('Planning Pose target')
@@ -317,31 +341,35 @@ class CumotionGoalSetPlannerServer(CumotionActionServer):
                     return result
 
                 self.toggle_link_collision(plan_req.disable_collision_links, False)
-                if poses.shape[1] == 1:
-                    poses.position = poses.position.view(-1, 3)
-                    poses.quaternion = poses.quaternion.view(-1, 4)
-                    motion_gen_result = self.motion_gen.plan_single(
-                        start_state,
-                        poses,
-                        MotionGenPlanConfig(
-                            max_attempts=self._CumotionActionServer__max_attempts,
-                            enable_graph_attempt=1,
-                            time_dilation_factor=time_dilation_factor,
-                            pose_cost_metric=pose_cost_metric,
-                        ),
-                    )
-                else:
-                    motion_gen_result = self.motion_gen.plan_goalset(
-                        start_state,
-                        poses,
-                        MotionGenPlanConfig(
-                            max_attempts=self._CumotionActionServer__max_attempts,
-                            enable_graph_attempt=1,
-                            time_dilation_factor=time_dilation_factor,
-                            pose_cost_metric=pose_cost_metric,
-                        ),
-                    )
-                self.toggle_link_collision(plan_req.disable_collision_links, True)
+                try:
+                    if poses.shape[1] == 1:
+                        poses.position = poses.position.view(-1, 3)
+                        poses.quaternion = poses.quaternion.view(-1, 4)
+                        motion_gen_result = self.motion_gen.plan_single(
+                            start_state,
+                            poses,
+                            MotionGenPlanConfig(
+                                max_attempts=self._CumotionActionServer__max_attempts,
+                                enable_graph_attempt=1,
+                                time_dilation_factor=time_dilation_factor,
+                                pose_cost_metric=pose_cost_metric,
+                            ),
+                        )
+                    else:
+                        motion_gen_result = self.motion_gen.plan_goalset(
+                            start_state,
+                            poses,
+                            MotionGenPlanConfig(
+                                max_attempts=self._CumotionActionServer__max_attempts,
+                                enable_graph_attempt=1,
+                                time_dilation_factor=time_dilation_factor,
+                                pose_cost_metric=pose_cost_metric,
+                            ),
+                        )
+                finally:
+                    # Re-enable disabled links even if the plan raises, so the
+                    # next plan is not collision-blind on those links (BUG C).
+                    self.toggle_link_collision(plan_req.disable_collision_links, True)
 
             if motion_gen_result is None:
                 # Neither plan_cspace nor plan_pose was set — there is nothing to

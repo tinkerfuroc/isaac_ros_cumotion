@@ -435,6 +435,27 @@ class CumotionActionServer(Node):
             self, MoveGroup, 'cumotion/move_group', self.execute_callback
         )
 
+    def _try_acquire_planner(self):
+        """Atomically reserve the (non-reentrant) MotionGen instance.
+
+        Returns True and marks the planner busy if it was free, otherwise
+        returns False without changing state. The check-and-set is performed
+        under ``self.lock`` so two concurrent action callbacks (the executor is
+        MultiThreaded) can never both observe ``planner_busy is False`` and
+        proceed into ``motion_gen.plan_*`` simultaneously. cuRobo MotionGen is
+        not reentrant; overlapping plan calls corrupt state or crash.
+        """
+        with self.lock:
+            if self.planner_busy:
+                return False
+            self.planner_busy = True
+            return True
+
+    def _release_planner(self):
+        """Release the MotionGen reservation taken by _try_acquire_planner."""
+        with self.lock:
+            self.planner_busy = False
+
     def js_callback(self, msg):
         self.__js_buffer = {
             'joint_names': msg.name,
@@ -849,8 +870,26 @@ class CumotionActionServer(Node):
                                str(time_dilation_factor))
         plan_req = goal_handle.request.request
 
-        goal_handle.succeed()
+        # Acquire the (non-reentrant) MotionGen BEFORE any motion_gen access
+        # (update_world_objects / get_active_js / reset / plan_*), so the whole
+        # operation is atomic with respect to a concurrent goalset plan. The
+        # acquire is before succeed() so a busy-reject aborts a goal that was
+        # never succeeded (no abort-after-succeed warning).
+        if not self._try_acquire_planner():
+            self.get_logger().error('Planner is busy')
+            goal_handle.abort()
+            result = MoveGroup.Result()
+            result.error_code.val = MoveItErrorCodes.FAILURE
+            return result
 
+        goal_handle.succeed()
+        try:
+            return self._run_execute(goal_handle, plan_req, time_dilation_factor)
+        finally:
+            # Always release, even if any motion_gen call raises (BUG A).
+            self._release_planner()
+
+    def _run_execute(self, goal_handle, plan_req, time_dilation_factor):
         scene = goal_handle.request.planning_options.planning_scene_diff
 
         world_objects = scene.world.collision_objects
@@ -997,9 +1036,9 @@ class CumotionActionServer(Node):
             result = MoveGroup.Result()
             result.error_code.val = MoveItErrorCodes.INVALID_GOAL_CONSTRAINTS
             return result
-        with self.lock:
-            self.planner_busy = True
-
+        # Planner already reserved at the top of execute_callback (before
+        # update_world_objects) and released in its finally; reset()+plan run
+        # plain here inside the protected _run_execute body.
         self.motion_gen.reset(reset_seed=False)
         if plan_mode == "joint":
             motion_gen_result = self.motion_gen.plan_single_js(
@@ -1021,8 +1060,6 @@ class CumotionActionServer(Node):
                     time_dilation_factor=time_dilation_factor,
                 ),
             )
-        with self.lock:
-            self.planner_busy = False
         # One-shot snapshot after the first real plan — captures any allocation
         # the goal-set plan adds on top of warmup (CUDA graphs for the actual
         # problem shapes). No-op unless CUMOTION_MEM_SNAPSHOT is set.
