@@ -109,6 +109,10 @@ class AttachObjectServer(Node):
                                '/camera_1/aligned_depth_to_color/camera_info'])
         self.declare_parameter('object_link_name', 'attached_object')
         self.declare_parameter('object_attachment_gripper_frame_name', 'grasp_frame')
+        # patched 2026-06-22: make the TF root frame configurable (upstream
+        # hardcoded 'world' in calculate_world_T_object). Our TF root is
+        # 'base_link'; override via the launch param.
+        self.declare_parameter('world_frame_name', 'world')
         self.declare_parameter(
             'action_names', rclpy.Parameter.Type.STRING_ARRAY)
         self.declare_parameter('search_radius', 0.2)
@@ -171,6 +175,9 @@ class AttachObjectServer(Node):
             'object_link_name').get_parameter_value().string_value
         self.__gripper_frame_name = self.get_parameter(
             'object_attachment_gripper_frame_name').get_parameter_value().string_value
+        # patched 2026-06-22: world_frame_name param (default 'world')
+        self.__world_frame_name = self.get_parameter(
+            'world_frame_name').get_parameter_value().string_value
         self.__action_names = list(self.get_parameter(
             'action_names').get_parameter_value().string_array_value)
         self.__search_radius = self.get_parameter(
@@ -680,13 +687,17 @@ class AttachObjectServer(Node):
         """Compute the transform to go from local object frame to world frame."""
         grasp_pose_object = self.__attached_object_config.pose
         try:
+            # patched 2026-06-22: use world_frame_name param (default 'world');
+            # our TF root is 'base_link', so the launch overrides this.
             world_pose_grasp = self.__tf_buffer.lookup_transform(
-                'world',
+                self.__world_frame_name,
                 'grasp_frame',
                 rclpy.time.Time()
             )
         except Exception as ex:
-            self.get_logger.error(f'Could not transform world to grasp_frame: {ex}')
+            # patched 2026-06-22: get_logger() typo in upstream (missing parens)
+            self.get_logger().error(
+                f'Could not transform {self.__world_frame_name} to grasp_frame: {ex}')
             return None
 
         grasp_T_object = np.eye(4)
