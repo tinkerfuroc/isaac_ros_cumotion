@@ -98,6 +98,14 @@ class CumotionRobotSegmenter(Node):
         self.declare_parameter('use_cuda_graph', True)
         self.declare_parameter('time_sync_slop', 0.1)
         self.declare_parameter('tf_lookup_duration', 5.0)
+        # SAFETY (fix #7): the head (camera idx >= 1) re-looks-up its extrinsic
+        # EVERY frame (it rides the moving pan-tilt). On the single-threaded
+        # executor a missing head TF would otherwise block on_timer — and thus
+        # WRIST masking — for the full tf_lookup_duration (5 s). Bound the
+        # per-frame head wait to a short timeout so a momentarily-missing head
+        # TF can't stall the whole loop. The wrist (idx 0) is a one-time cached
+        # startup lookup and keeps the long tf_lookup_duration unchanged.
+        self.declare_parameter('head_tf_lookup_duration', 0.1)
 
         self.declare_parameter('joint_states_topic', '/joint_states')
         self.declare_parameter('debug_robot_topic', '/cumotion/robot_segmenter/robot_spheres')
@@ -146,6 +154,10 @@ class CumotionRobotSegmenter(Node):
         time_sync_slop = self.get_parameter('time_sync_slop').get_parameter_value().double_value
         self._tf_lookup_duration = (
             self.get_parameter('tf_lookup_duration').get_parameter_value().double_value
+        )
+        # Short per-frame TF wait for the head (idx >= 1); see CHANGE 1 above.
+        self._head_tf_lookup_duration = (
+            self.get_parameter('head_tf_lookup_duration').get_parameter_value().double_value
         )
         joint_states_topic = (
             self.get_parameter('joint_states_topic').get_parameter_value().string_value)
@@ -374,10 +386,13 @@ class CumotionRobotSegmenter(Node):
         depth_image[filtered_combined_mask.astype(bool)] = invalid_depth_value
         return (filtered_combined_mask, depth_image)
 
-    def publish_images(self, depth_mask, segmented_depth, camera_header, idx: int):
+    def publish_images(self, depth_mask, segmented_depth, camera_header, idx: int, encoding):
         # depth_mask / segmented_depth are this camera's single (H_i, W_i) arrays;
-        # camera_header is this camera's header. idx selects the matching publisher
-        # and per-camera encoding.
+        # camera_header is this camera's header. idx selects the matching publisher.
+        # CHANGE 5: `encoding` is the per-camera depth encoding SNAPSHOTTED under
+        # self.lock in on_timer (alongside depth_buffers / camera_headers), so the
+        # segmented re-cast below no longer reads self._depth_encoding[idx]
+        # unguarded — it uses the same self-consistent tick snapshot as the frame.
         if self._filter_speckles_in_mask:
             depth_mask, segmented_depth = self.filter_depth_mask(depth_mask, segmented_depth)
 
@@ -387,11 +402,11 @@ class CumotionRobotSegmenter(Node):
             self.mask_publishers[idx].publish(msg)
 
         if self.segmented_publishers[idx].get_subscription_count() > 0:
-            if self._depth_encoding[idx] == '16UC1':
+            if encoding == '16UC1':
                 segmented_depth = segmented_depth.astype(np.uint16)
-            elif self._depth_encoding[idx] == '32FC1':
+            elif encoding == '32FC1':
                 segmented_depth = segmented_depth / 1000.0
-            msg = self.br.cv2_to_imgmsg(segmented_depth, self._depth_encoding[idx])
+            msg = self.br.cv2_to_imgmsg(segmented_depth, encoding)
             msg.header = camera_header
             self.segmented_publishers[idx].publish(msg)
 
@@ -431,6 +446,143 @@ class CumotionRobotSegmenter(Node):
         for attr in ('_cu_cam_obs', '_cu_q', '_cu_out', '_cu_filtered_out'):
             if hasattr(seg, attr):
                 setattr(seg, attr, None)
+
+    def _camera_pose(self, i, frame_id, stamp):
+        """Resolve camera ``i``'s base_frame <- optical-frame extrinsic (CuPose).
+
+        Encapsulates the per-camera TF gating extracted from on_timer with
+        identical behavior:
+
+          - WRIST (idx 0): frozen extrinsic. need_tf is True only on the first
+            acquire (cached pose is None); thereafter the cached CuPose is
+            returned without a lookup — byte-for-byte the validated
+            single-camera once-only behavior. Its lookup uses the long
+            self._tf_lookup_duration (~5 s) at its own first-frame js stamp.
+          - HEAD / any idx >= 1: rides the moving pan-tilt, so need_tf is True
+            EVERY tick — re-looked-up at `stamp` (the joint-state stamp this
+            camera's depth was synced against). CHANGE 1: the head uses the
+            SHORT self._head_tf_lookup_duration so a momentarily-missing head TF
+            can't stall the single-threaded loop (and thus wrist masking).
+
+        On a TransformException returns None (caller skips this frame, NEVER
+        masking with a stale pose) — same as the pre-refactor `continue`.
+        """
+        need_tf = (self._robot_pose_camera[i] is None) or (i > 0)
+        if not need_tf:
+            return self._robot_pose_camera[i]
+        # Per-camera timeout: long one-time wait for the wrist (idx 0), short
+        # bounded wait for the moving head (idx >= 1) — see CHANGE 1.
+        tf_timeout = (
+            self._tf_lookup_duration if i == 0 else self._head_tf_lookup_duration)
+        try:
+            t = self.tf_buffer.lookup_transform(
+                self._cumotion_base_frame,
+                frame_id,
+                stamp,
+                rclpy.duration.Duration(seconds=tf_timeout),
+            )
+        except TransformException as ex:
+            self.get_logger().debug(
+                f'Could not transform {frame_id}'
+                f'to { self._cumotion_base_frame}: {ex}',
+                throttle_duration_sec=2.0)
+            return None
+        self._robot_pose_camera[i] = CuPose.from_list(
+            [
+                t.transform.translation.x,
+                t.transform.translation.y,
+                t.transform.translation.z,
+                t.transform.rotation.w,
+                t.transform.rotation.x,
+                t.transform.rotation.y,
+                t.transform.rotation.z,
+            ]
+        )
+        return self._robot_pose_camera[i]
+
+    def _ensure_projection(self, i, intrinsic_np, hw):
+        """Re-point the shared segmenter's projection at camera ``i`` if needed.
+
+        Extracted verbatim from on_timer. Two-part gating, unchanged:
+
+          1. If the segmenter's cached resolution differs from this camera's
+             (hw), drop the resolution-dependent caches first
+             (_reset_seg_caches_for_resolution) so update_camera_projection's
+             in-place .copy_() gets a matching shape.
+          2. Re-project (update_camera_projection) whenever the segmenter isn't
+             ready, the resolution changed, OR the processed camera INDEX changed
+             (projection rays bake in this camera's fx,fy,cx,cy). For the single
+             fixed-resolution camera (idx always 0) this fires once on the first
+             frame and never again — once-only, exactly as before.
+        """
+        if self._seg_cached_hw is not None and self._seg_cached_hw != hw:
+            self._reset_seg_caches_for_resolution()
+        if ((not self._cumotion_segmenter.ready)
+                or (self._seg_cached_hw != hw)
+                or (self._last_proj_cam_idx != i)):
+            depth_image = self._tensor_args.to_device(
+                np.zeros(hw, dtype=np.float32))
+            depth_image = depth_image.view(1, hw[0], hw[1])
+            intrinsics = self._tensor_args.to_device(
+                np.copy(intrinsic_np)).view(1, 3, 3)
+            cam_obs_proj = CameraObservation(
+                depth_image=depth_image, intrinsics=intrinsics)
+            self._cumotion_segmenter.update_camera_projection(cam_obs_proj)
+            self._seg_cached_hw = hw
+            self._last_proj_cam_idx = i
+            # CHANGE 4: was an info() that fired on every camera switch (~per
+            # tick with two differing-resolution cameras). Demoted to debug().
+            self.get_logger().debug(
+                f'Updated Projection Matrices for camera {i} at {hw[1]}x{hw[0]}')
+
+    def _mask_camera(self, i, depth_np, header, cam_js_i, intrinsic, encoding):
+        """Mask camera ``i``'s depth against the robot body and publish it.
+
+        Builds this camera's batch-1 depth tensor + per-camera active joint
+        state, ensures the shared segmenter is projected for this camera
+        (_ensure_projection), runs get_robot_mask_from_active_js, and publishes
+        the mask + world-depth. Returns the per-camera active js (q_i) so the
+        caller can reuse the most-recent one for the debug robot-spheres viz.
+
+        ``intrinsic`` / ``encoding`` are the per-camera values snapshotted under
+        the lock in on_timer (so this never re-reads shared self._depth_*).
+        Logic is lifted verbatim from the old on_timer loop body (the masked
+        OUTPUT is unchanged); only the projection bookkeeping moved into
+        _ensure_projection and the pose lookup into _camera_pose.
+        """
+        # FIX 6: build THIS camera's active joint state from the joint state its
+        # depth was synced against (cam_js_i), not a shared js overwritten by
+        # other cameras' callbacks.
+        q_i = CuJointState.from_numpy(
+            position=np.copy(cam_js_i['position']),
+            joint_names=deepcopy(cam_js_i['joint_names']),
+            tensor_args=self._tensor_args).unsqueeze(0)
+        q_i = self._cumotion_segmenter.robot_world.get_active_js(q_i)
+
+        # Build this camera's batch-1 depth tensor (1, H_i, W_i).
+        depth_image = self._tensor_args.to_device(depth_np.astype(np.float32))
+        depth_image = depth_image.view(1, depth_image.shape[-2], depth_image.shape[-1])
+        this_hw = (depth_image.shape[-2], depth_image.shape[-1])
+
+        # Re-point the shared segmenter's projection at THIS camera (no-op for a
+        # single fixed-resolution camera after the first frame).
+        self._ensure_projection(i, intrinsic, this_hw)
+
+        # FIX 2: pass the cached pose directly. CuPose.from_list already yields
+        # position (1,3) / quaternion (1,4) (batch-1), matching the pre-refactor
+        # CuPose.cat([p]) shape.
+        cam_obs = CameraObservation(
+            depth_image=depth_image,
+            pose=self._robot_pose_camera[i])
+
+        depth_mask, segmented_depth = \
+            self._cumotion_segmenter.get_robot_mask_from_active_js(cam_obs, q_i)
+        depth_mask = depth_mask.cpu().numpy().astype(np.uint8) * 255
+        segmented_depth = segmented_depth.cpu().numpy()
+
+        # batch-1: take element 0 for this camera.
+        self.publish_images(depth_mask[0], segmented_depth[0], header, i, encoding)
+        return q_i
 
     def on_timer(self):
         # CONCURRENCY INVARIANT (FIX 8): this per-camera masking loop and the
@@ -472,6 +624,11 @@ class CumotionRobotSegmenter(Node):
             depth_buffers = list(self._depth_buffers)
             camera_headers = list(self._camera_headers)
             depth_intrinsics = list(self._depth_intrinsics)
+            # CHANGE 5: snapshot the per-camera depth encoding under the lock too,
+            # for symmetry with depth_buffers/camera_headers — publish_images now
+            # takes the snapshotted value instead of reading self._depth_encoding
+            # unguarded. (Callbacks REPLACE the slot, so list() is a stable view.)
+            depth_encodings = list(self._depth_encoding)
             # FIX 6: snapshot the per-camera joint state + its stamp. list() is a
             # shallow copy of the slot references; callbacks REPLACE slots (never
             # mutate the stored dict/stamp), so each captured entry stays the exact
@@ -504,9 +661,9 @@ class CumotionRobotSegmenter(Node):
         if not pending:
             return
 
-        # FIX 6: q is now built PER CAMERA inside the loop from cam_js[i] (the joint
-        # state that camera's depth was synced against), so there is no single
-        # shared q build here anymore.
+        # FIX 6: q is built PER CAMERA inside _mask_camera from cam_js[i] (the
+        # joint state that camera's depth was synced against), so there is no
+        # single shared q build here.
 
         start_segmentation_time = time.time()
         any_processed = False
@@ -516,116 +673,44 @@ class CumotionRobotSegmenter(Node):
 
         # Process cameras in array order so camera_0 (wrist) is always first.
         for i in pending:
-            depth_np = depth_buffers[i]
             header = camera_headers[i]
-            intrinsic = depth_intrinsics[i]
-
             frame_stamp = (header.stamp.sec, header.stamp.nanosec)
-
-            # FIX 6: build THIS camera's active joint state from the joint state its
-            # depth was synced against (cam_js[i]), not a shared js overwritten by
-            # other cameras' callbacks. cam_js[i] is guaranteed non-None here (the
-            # pending pre-pass skipped None entries), but guard defensively.
-            cam_js_i = cam_js[i]
-            if cam_js_i is None:
-                continue
-            q_i = CuJointState.from_numpy(
-                position=np.copy(cam_js_i['position']),
-                joint_names=deepcopy(cam_js_i['joint_names']),
-                tensor_args=self._tensor_args).unsqueeze(0)
-            q_i = self._cumotion_segmenter.robot_world.get_active_js(q_i)
-            last_q = q_i
-
-            # Per-camera TF lookup (base_frame <- this camera's optical frame).
-            #
-            # WRIST (camera index 0): frozen extrinsic. It barely images the arm
-            # and the validated single-camera behaviour caches the TF once. So for
-            # idx 0 we look up only on first acquire and reuse the cached pose.
-            #
-            # HEAD and any camera index >= 1: mounted on the moving pan-tilt, so the
-            # extrinsic changes every frame — RE-LOOKUP every tick. Never mask the
-            # head with a stale extrinsic; on lookup failure skip this frame.
-            need_tf = (self._robot_pose_camera[i] is None) or (i > 0)
-            if need_tf:
-                try:
-                    # FIX 6: look up THIS camera's extrinsic at the stamp of the
-                    # joint state its depth was synced against (cam_js_stamp[i]),
-                    # not the shared self._timestamp (overwritten by other cameras'
-                    # callbacks). For the wrist (idx 0, frozen once) this is its own
-                    # first-frame js stamp — identical to the original behaviour.
-                    t = self.tf_buffer.lookup_transform(
-                        self._cumotion_base_frame,
-                        header.frame_id,
-                        cam_js_stamp[i],
-                        rclpy.duration.Duration(seconds=self._tf_lookup_duration),
-                    )
-                    self._robot_pose_camera[i] = CuPose.from_list(
-                        [
-                            t.transform.translation.x,
-                            t.transform.translation.y,
-                            t.transform.translation.z,
-                            t.transform.rotation.w,
-                            t.transform.rotation.x,
-                            t.transform.rotation.y,
-                            t.transform.rotation.z,
-                        ]
-                    )
-                except TransformException as ex:
-                    self.get_logger().debug(
-                        f'Could not transform {header.frame_id}'
-                        f'to { self._cumotion_base_frame}: {ex}')
+            try:
+                # cam_js[i] is guaranteed non-None here (the pending pre-pass
+                # skipped None entries), but guard defensively.
+                cam_js_i = cam_js[i]
+                if cam_js_i is None:
                     continue
 
-            # Build this camera's batch-1 depth tensor (1, H_i, W_i).
-            depth_image = self._tensor_args.to_device(depth_np.astype(np.float32))
-            depth_image = depth_image.view(1, depth_image.shape[-2], depth_image.shape[-1])
-            this_hw = (depth_image.shape[-2], depth_image.shape[-1])
+                # Per-camera extrinsic (base_frame <- optical frame). Wrist (idx 0)
+                # is frozen + cached once; head (idx >= 1) re-looks-up every tick
+                # with a short timeout. Returns None on TF failure -> skip frame
+                # (never masked with a stale pose).
+                pose = self._camera_pose(i, header.frame_id, cam_js_stamp[i])
+                if pose is None:
+                    continue
 
-            # Re-point the shared segmenter's projection at THIS camera's
-            # resolution. For a single fixed-resolution camera the cache is set up
-            # exactly once (first frame) and reused thereafter — identical to the
-            # original behaviour. With multiple differing resolutions we reset the
-            # resolution-dependent caches whenever the size changes from the
-            # last-processed camera before re-projecting.
-            if self._seg_cached_hw is not None and self._seg_cached_hw != this_hw:
-                self._reset_seg_caches_for_resolution()
-            # Re-project whenever the segmenter isn't ready, the resolution changed,
-            # OR the processed camera INDEX changed. Projection rays bake in this
-            # camera's fx,fy,cx,cy, so two same-resolution different-intrinsics
-            # cameras must each re-project. For the single-camera case idx is always
-            # 0, so after the first frame (ready, same hw, last_idx == 0) this never
-            # re-projects again — once-only, exactly as before.
-            if ((not self._cumotion_segmenter.ready)
-                    or (self._seg_cached_hw != this_hw)
-                    or (self._last_proj_cam_idx != i)):
-                intrinsics = self._tensor_args.to_device(
-                    np.copy(intrinsic)).view(1, 3, 3)
-                cam_obs_proj = CameraObservation(
-                    depth_image=depth_image, intrinsics=intrinsics)
-                self._cumotion_segmenter.update_camera_projection(cam_obs_proj)
-                self._seg_cached_hw = this_hw
-                self._last_proj_cam_idx = i
-                self.get_logger().info(
-                    f'Updated Projection Matrices for camera {i} at {this_hw[1]}x{this_hw[0]}')
-
-            # FIX 2: pass the cached pose directly. CuPose.from_list already yields
-            # position (1,3) / quaternion (1,4) (batch-1), matching the pre-refactor
-            # CuPose.cat([p]) shape. The old .unsqueeze(0) reassigned the cached
-            # pose's tensors in place (Pose.unsqueeze mutates self and returns self),
-            # so the cached wrist pose grew a leading dim every tick.
-            cam_obs = CameraObservation(
-                depth_image=depth_image,
-                pose=self._robot_pose_camera[i])
-
-            depth_mask, segmented_depth = \
-                self._cumotion_segmenter.get_robot_mask_from_active_js(cam_obs, q_i)
-            depth_mask = depth_mask.cpu().numpy().astype(np.uint8) * 255
-            segmented_depth = segmented_depth.cpu().numpy()
-
-            # batch-1: take element 0 for this camera.
-            self.publish_images(depth_mask[0], segmented_depth[0], header, i)
-            self._processed_stamp[i] = frame_stamp
-            any_processed = True
+                # Mask + publish this camera; returns its per-camera active js.
+                q_i = self._mask_camera(
+                    i, depth_buffers[i], header, cam_js_i,
+                    depth_intrinsics[i], depth_encodings[i])
+                last_q = q_i
+                # Only mark the frame masked on the SUCCESS path so a frame that
+                # raised below retries on the next tick.
+                self._processed_stamp[i] = frame_stamp
+                any_processed = True
+            except Exception as ex:
+                # CHANGE 2: a fault in ONE camera (curobo get_active_js ValueError
+                # on a missing joint, a malformed frame, a CUDA hiccup, ...) is
+                # logged + skipped so the OTHER cameras still process and on_timer
+                # never dies. Catch Exception (NOT BaseException) so
+                # KeyboardInterrupt/SystemExit still propagate. Throttled so a
+                # persistently-bad camera can't flood the logs. _processed_stamp[i]
+                # is intentionally NOT set here, so the frame retries.
+                self.get_logger().warn(
+                    f'robot_segmenter: camera {i} frame skipped: {ex}',
+                    throttle_duration_sec=2.0)
+                continue
 
         if not any_processed:
             return
