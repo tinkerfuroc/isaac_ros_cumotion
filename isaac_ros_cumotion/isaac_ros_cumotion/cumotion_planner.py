@@ -469,7 +469,10 @@ class CumotionActionServer(Node):
             {
                 'cuboid': {
                     'table': {
-                        'pose': [0, 0, -0.05, 1, 0, 0, 0],  # x, y, z, qw, qx, qy, qz
+                        # top face at z=0.73 (base_link, ~floor height) = competition
+                        # desktop height; perception-independent floor so cuMotion
+                        # never plans below the desk even if the ESDF is stale/empty.
+                        'pose': [0, 0, 0.68, 1, 0, 0, 0],  # x, y, z, qw, qx, qy, qz
                         'dims': [2.0, 2.0, 0.1],
                     }
                 },
