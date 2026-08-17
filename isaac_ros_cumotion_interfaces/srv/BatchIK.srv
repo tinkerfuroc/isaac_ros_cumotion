@@ -1,0 +1,18 @@
+# Generic batch IK query against the planner node's live collision world.
+# Mechanism only: no scoring, no ranking — callers apply their own policy.
+geometry_msgs/PoseArray poses
+# World collision objects to temporarily disable during the solve (e.g. the
+# target object mesh — otherwise every grasp pose "collides" with the thing
+# being grasped). Unknown names are ignored with a warning.
+string[] world_objects_to_ignore
+---
+# Parallel to request poses.
+bool[] success
+uint16 dof
+# Flattened row-major joint solutions: poses.size * dof entries.
+float64[] joint_positions
+float64[] position_error
+float64[] rotation_error
+# Range-normalized squared joint-space distance to the retract config.
+float64[] posture_cost
+string message

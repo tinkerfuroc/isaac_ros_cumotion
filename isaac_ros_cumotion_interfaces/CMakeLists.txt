@@ -39,8 +39,13 @@ set(ACTION_FILES
 "action/UpdateLinkSpheres.action"
 )
 
+set(SRV_FILES
+"srv/BatchIK.srv"
+)
+
 rosidl_generate_interfaces(${PROJECT_NAME}
   ${ACTION_FILES}
+  ${SRV_FILES}
   DEPENDENCIES geometry_msgs moveit_msgs sensor_msgs visualization_msgs
 )
 ament_export_dependencies(rosidl_default_runtime)
