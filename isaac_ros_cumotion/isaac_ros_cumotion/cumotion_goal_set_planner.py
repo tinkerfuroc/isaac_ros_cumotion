@@ -7,6 +7,7 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
+import threading
 from typing import List
 
 from curobo.types.math import Pose
@@ -16,6 +17,7 @@ from curobo.wrap.reacher.motion_gen import MotionGenStatus
 from curobo.wrap.reacher.motion_gen import PoseCostMetric
 from isaac_ros_cumotion.cumotion_planner import CumotionActionServer
 from isaac_ros_cumotion_interfaces.action import MotionPlan
+from isaac_ros_cumotion_interfaces.srv import BatchIK
 from moveit_msgs.msg import MoveItErrorCodes
 import rclpy
 from rclpy.action import ActionServer
@@ -30,6 +32,86 @@ class CumotionGoalSetPlannerServer(CumotionActionServer):
         self._goal_set_planner_server = ActionServer(
             self, MotionPlan, 'cumotion/motion_plan', self.motion_plan_execute_callback
         )
+        # Generic batch-IK mechanism (spec §6): poses in -> per-pose
+        # feasibility/solution/posture-cost out, judged against the SAME
+        # world model plan_grasp uses. No scoring policy lives here.
+        self._batch_ik_srv = self.create_service(
+            BatchIK, 'cumotion/batch_ik', self.batch_ik_callback)
+        # Fixed solver batch: pad/chunk requests so cuRobo's CUDA-graph
+        # capture never sees a changing batch size.
+        self._batch_ik_pad = 32
+        # Serializes batch_ik against itself; a concurrent motion_plan goal
+        # that toggles the same obstacles is the caller's responsibility to
+        # sequence (pick_and_place calls rank -> plan strictly in order).
+        self._batch_ik_lock = threading.Lock()
+
+    def batch_ik_callback(self, request, response):
+        import torch
+
+        poses = request.poses.poses
+        n = len(poses)
+        if n == 0:
+            response.message = 'empty pose array'
+            return response
+        ik = self.motion_gen.ik_solver
+        with self._batch_ik_lock:
+            disabled = []
+            for name in request.world_objects_to_ignore:
+                try:
+                    self.motion_gen.world_coll_checker.enable_obstacle(
+                        name=name, enable=False)
+                    disabled.append(name)
+                except Exception as exc:  # noqa: BLE001 — unknown name is a no-op
+                    self.get_logger().warn(
+                        f'batch_ik: cannot disable obstacle {name}: {exc}')
+            try:
+                retract = self.motion_gen.kinematics.retract_config.view(-1)
+                # JointLimits.position is [n_joints, 2] (min, max columns).
+                jl = self.motion_gen.kinematics.get_joint_limits().position
+                joint_range = (jl[:, 1] - jl[:, 0]).view(-1).clamp(min=1e-6)
+                succ, sols, perr, rerr, pcost = [], [], [], [], []
+                for lo in range(0, n, self._batch_ik_pad):
+                    chunk = poses[lo:lo + self._batch_ik_pad]
+                    pad = self._batch_ik_pad - len(chunk)
+                    plist = [[p.position.x, p.position.y, p.position.z,
+                              p.orientation.w, p.orientation.x,
+                              p.orientation.y, p.orientation.z]
+                             for p in chunk]
+                    plist += [plist[-1]] * pad
+                    goal = Pose.from_batch_list(
+                        plist, self.motion_gen.tensor_args)
+                    res = ik.solve_batch(goal)
+                    k = len(chunk)
+                    succ += [bool(v) for v in res.success.view(-1)[:k].tolist()]
+                    q = res.js_solution.position.reshape(
+                        self._batch_ik_pad, -1)[:k]
+                    sols.append(q)
+                    perr += [float(v) for v in
+                             res.position_error.view(-1)[:k].tolist()]
+                    rerr += [float(v) for v in
+                             res.rotation_error.view(-1)[:k].tolist()]
+                    d = ((q - retract.unsqueeze(0)) /
+                         joint_range.unsqueeze(0)) ** 2
+                    pcost += [float(v) for v in d.sum(dim=1).tolist()]
+            except Exception as exc:  # noqa: BLE001 — solver misconfig must not
+                # take the planner node down; callers degrade to unranked.
+                self.get_logger().error(f'batch_ik: solve failed: {exc}')
+                response.message = f'solve failed: {exc}'
+                return response
+            finally:
+                for name in disabled:
+                    self.motion_gen.world_coll_checker.enable_obstacle(
+                        name=name, enable=True)
+        q_all = torch.cat(sols, dim=0)
+        response.dof = int(q_all.shape[1])
+        response.success = succ
+        response.joint_positions = [float(v) for v in
+                                    q_all.reshape(-1).tolist()]
+        response.position_error = perr
+        response.rotation_error = rerr
+        response.posture_cost = pcost
+        response.message = 'ok'
+        return response
 
     def warmup(self):
         self.get_logger().info('warming up cuMotion, wait until ready')
