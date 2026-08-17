@@ -12,6 +12,8 @@ from typing import List
 
 from curobo.types.math import Pose
 from curobo.types.state import JointState as CuJointState
+from curobo.wrap.reacher.ik_solver import IKSolver
+from curobo.wrap.reacher.ik_solver import IKSolverConfig
 from curobo.wrap.reacher.motion_gen import MotionGenPlanConfig
 from curobo.wrap.reacher.motion_gen import MotionGenStatus
 from curobo.wrap.reacher.motion_gen import PoseCostMetric
@@ -28,6 +30,18 @@ class CumotionGoalSetPlannerServer(CumotionActionServer):
 
     def __init__(self):
 
+        # Set before super().__init__(): the base ctor calls self.warmup(),
+        # which our override extends and which reads these attributes.
+        # Fixed solver batch: pad/chunk requests so the solver never sees a
+        # changing batch size.
+        self._batch_ik_pad = 32
+        # Dedicated solver built in warmup(); motion_gen.ik_solver is
+        # CUDA-graph-captured for goalset goals and rejects other goal types.
+        self._batch_ik_solver = None
+        # Serializes batch_ik against itself; a concurrent motion_plan goal
+        # that toggles the same obstacles is the caller's responsibility to
+        # sequence (pick_and_place calls rank -> plan strictly in order).
+        self._batch_ik_lock = threading.Lock()
         super().__init__()
         self._goal_set_planner_server = ActionServer(
             self, MotionPlan, 'cumotion/motion_plan', self.motion_plan_execute_callback
@@ -37,13 +51,6 @@ class CumotionGoalSetPlannerServer(CumotionActionServer):
         # world model plan_grasp uses. No scoring policy lives here.
         self._batch_ik_srv = self.create_service(
             BatchIK, 'cumotion/batch_ik', self.batch_ik_callback)
-        # Fixed solver batch: pad/chunk requests so cuRobo's CUDA-graph
-        # capture never sees a changing batch size.
-        self._batch_ik_pad = 32
-        # Serializes batch_ik against itself; a concurrent motion_plan goal
-        # that toggles the same obstacles is the caller's responsibility to
-        # sequence (pick_and_place calls rank -> plan strictly in order).
-        self._batch_ik_lock = threading.Lock()
 
     def batch_ik_callback(self, request, response):
         import torch
@@ -53,7 +60,10 @@ class CumotionGoalSetPlannerServer(CumotionActionServer):
         if n == 0:
             response.message = 'empty pose array'
             return response
-        ik = self.motion_gen.ik_solver
+        ik = self._batch_ik_solver
+        if ik is None:
+            response.message = 'batch IK solver not warmed up yet'
+            return response
         with self._batch_ik_lock:
             disabled = []
             for name in request.world_objects_to_ignore:
@@ -66,9 +76,9 @@ class CumotionGoalSetPlannerServer(CumotionActionServer):
                         f'batch_ik: cannot disable obstacle {name}: {exc}')
             try:
                 retract = self.motion_gen.kinematics.retract_config.view(-1)
-                # JointLimits.position is [n_joints, 2] (min, max columns).
+                # JointLimits.position is [2, dof] (row 0 = min, row 1 = max).
                 jl = self.motion_gen.kinematics.get_joint_limits().position
-                joint_range = (jl[:, 1] - jl[:, 0]).view(-1).clamp(min=1e-6)
+                joint_range = (jl[1] - jl[0]).view(-1).clamp(min=1e-6)
                 succ, sols, perr, rerr, pcost = [], [], [], [], []
                 for lo in range(0, n, self._batch_ik_pad):
                     chunk = poses[lo:lo + self._batch_ik_pad]
@@ -83,8 +93,9 @@ class CumotionGoalSetPlannerServer(CumotionActionServer):
                     res = ik.solve_batch(goal)
                     k = len(chunk)
                     succ += [bool(v) for v in res.success.view(-1)[:k].tolist()]
-                    q = res.js_solution.position.reshape(
-                        self._batch_ik_pad, -1)[:k]
+                    # res.solution is active-DOF; js_solution would include
+                    # locked joints and mismatch retract/joint-limit shapes.
+                    q = res.solution.reshape(self._batch_ik_pad, -1)[:k]
                     sols.append(q)
                     perr += [float(v) for v in
                              res.position_error.view(-1)[:k].tolist()]
@@ -119,6 +130,19 @@ class CumotionGoalSetPlannerServer(CumotionActionServer):
         # measured flat (no savings) and was reverted -- see
         # docs/superpowers/specs/2026-06-10-manip-vram-budget-design.md.
         self.motion_gen.warmup(enable_graph=True, n_goalset=100, warmup_js_trajopt=True)
+        ik_config = IKSolverConfig.load_from_robot_config(
+            self.motion_gen.robot_cfg,
+            world_model=None,
+            tensor_args=self.motion_gen.tensor_args,
+            num_seeds=20,
+            use_cuda_graph=False,
+            world_coll_checker=self.motion_gen.world_coll_checker,
+        )
+        self._batch_ik_solver = IKSolver(ik_config)
+        dummy = Pose.from_batch_list(
+            [[0.3, 0.0, 0.3, 0.0, 1.0, 0.0, 0.0]] * self._batch_ik_pad,
+            self.motion_gen.tensor_args)
+        self._batch_ik_solver.solve_batch(dummy)
         self.get_logger().info('cuMotion is ready for planning queries!')
 
     def toggle_link_collision(self, collision_link_names: List[str],
