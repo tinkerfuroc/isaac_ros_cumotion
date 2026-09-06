@@ -30,6 +30,7 @@ from curobo.wrap.reacher.motion_gen import MotionGenPlanConfig
 from curobo.wrap.reacher.motion_gen import MotionGenStatus
 from geometry_msgs.msg import Point
 from geometry_msgs.msg import Vector3
+from isaac_ros_cumotion.interpolation_budget import check_interpolation_steps
 from isaac_ros_cumotion.update_kinematics import get_robot_config
 from isaac_ros_cumotion.update_kinematics import UpdateLinkSpheresServer
 from isaac_ros_cumotion_python_utils.utils import \
@@ -309,6 +310,19 @@ class CumotionActionServer(Node):
         )
         self.__maximum_trajectory_dt = (
             self.get_parameter('maximum_trajectory_dt').get_parameter_value().double_value
+        )
+        # Fail fast on an undersized interpolation buffer: an overflow would
+        # regrow it but leave the metrics CUDA graph invalid, so later plans
+        # fail intermittently (see interpolation_budget.py).
+        required_steps = check_interpolation_steps(
+            self.__interpolation_steps,
+            self.__num_trajopt_time_steps,
+            self.__maximum_trajectory_dt,
+            self.__interpolation_dt,
+        )
+        self.get_logger().info(
+            f'interpolation_steps={self.__interpolation_steps} '
+            f'(plans need at most {required_steps} rows)'
         )
 
         include_trajopt_retract_seed = (
